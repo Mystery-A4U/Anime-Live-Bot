@@ -119,7 +119,7 @@ async def showfolders(e):
 
 @events.register(events.NewMessage(incoming=True))
 async def media(e):
-    if not admin(e) or not e.message.document: return
+    if not admin(e) or not (e.message.document or e.message.video): return
     n=getattr(e.message.document,"size",0) or 0
     if n>MAX_FILE_SIZE: return await e.respond(f"❌ File exceeds configured limit: **{size(MAX_FILE_SIZE)}**")
     state[e.sender_id]={"step":"name","msg":e.message,"original":fname(e.message),"size":n}
@@ -129,7 +129,7 @@ async def media(e):
 async def text(e):
     if not admin(e): return
     t=(e.raw_text or "").strip()
-    if not t or t.startswith("/") or e.message.document: return
+    if not t or t.startswith("/") or e.message.document or e.message.video: return
     s=state.get(e.sender_id)
     if not s: return
     if s["step"]=="name":
@@ -177,6 +177,12 @@ async def main():
     await client.start(bot_token=BOT_TOKEN)
     me=await client.get_me()
     print(f"🤖 Logged in as @{me.username or me.id}")
+
+    # Register the handlers defined with @events.register(...)
+    # Telethon does not automatically attach those handlers to a new client.
+    for handler in (start, cancel, showfolders, media, text, callback):
+        client.add_event_handler(handler)
+
     print("🚀 Anime4u MTProto B2 Uploader is running.")
     await client.run_until_disconnected()
 
