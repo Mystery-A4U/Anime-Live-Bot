@@ -72,27 +72,28 @@ async def upload(e, s):
     status=await e.respond("⬇️ **Downloading + ☁️ uploading...**\n\n"+f"📄 `{name}`\n📁 `{folder or '(root)'}`")
     fid=None; sha=[]; partno=1; total=s.get("size") or 0; done=0; buf=bytearray()
     try:
-        # b2sdk v2 exposes large-file operations on B2Api, not Bucket.
+        # b2sdk 2.x exposes the raw large-file operations through B2Session.
+        # Use the session facade so upload URLs/tokens are managed correctly.
         lf=await asyncio.to_thread(
-            b2.start_large_file,
-            bucket_id=bucket.id_,
-            file_name=obj,
-            content_type="b2/x-auto",
-            file_info={},
+            b2.session.start_large_file,
+            bucket.id_,
+            obj,
+            "b2/x-auto",
+            {},
         )
-        fid=lf.file_id
+        fid=lf["fileId"]
         async for chunk in msg.client.iter_download(msg.media, request_size=PART_SIZE, chunk_size=PART_SIZE):
             buf.extend(chunk)
             while len(buf)>=PART_SIZE:
                 part=bytes(buf[:PART_SIZE]); del buf[:PART_SIZE]
                 h=hashlib.sha1(part).hexdigest()
                 await asyncio.to_thread(
-                    b2.upload_part,
-                    file_id=fid,
-                    part_number=partno,
-                    content_length=len(part),
-                    sha1_sum=h,
-                    input_stream=__import__("io").BytesIO(part),
+                    b2.session.upload_part,
+                    fid,
+                    partno,
+                    len(part),
+                    h,
+                    __import__("io").BytesIO(part),
                 )
                 sha.append(h); done+=len(part)
                 pct=int(done*100/total) if total else 0
@@ -102,19 +103,19 @@ async def upload(e, s):
         if buf:
             part=bytes(buf); h=hashlib.sha1(part).hexdigest()
             await asyncio.to_thread(
-                b2.upload_part,
-                file_id=fid,
-                part_number=partno,
-                content_length=len(part),
-                sha1_sum=h,
-                input_stream=__import__("io").BytesIO(part),
+                b2.session.upload_part,
+                fid,
+                partno,
+                len(part),
+                h,
+                __import__("io").BytesIO(part),
             )
             sha.append(h); done+=len(part)
-        await asyncio.to_thread(b2.finish_large_file, file_id=fid, part_sha1_array=sha)
+        await asyncio.to_thread(b2.session.finish_large_file, fid, sha)
         await status.edit(f"✅ **UPLOAD COMPLETE**\n\n📄 `{name}`\n📁 `{folder or '(root)'}`\n\n☁️ **B2 path:**\n`{obj}`\n\n📦 Size: `{size(done)}`")
     except Exception as ex:
         if fid:
-            try: await asyncio.to_thread(b2.cancel_large_file, fid)
+            try: await asyncio.to_thread(b2.session.cancel_large_file, fid)
             except: pass
         try: await status.edit("❌ **Upload failed**\n\n`"+str(ex)[:1200]+"`")
         except: pass
