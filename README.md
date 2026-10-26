@@ -1,45 +1,45 @@
 # Anime4u Unified Upload Bot
 
-One Telegram admin bot with two upload destinations:
+One Telegram admin bot for two destinations:
 
-1. 🌐 Anime4u.Tamil
-   - Turso stores anime/season/episode metadata.
-   - MongoDB stores Telegram file references only.
-   - No video is copied into MongoDB or Turso.
+- 🌐 **Anime4u.Tamil** → Turso metadata + MongoDB Telegram file references
+- 🔴 **Anime Live** → Backblaze B2 media upload using Telethon/MTProto
 
-2. 🔴 Anime Live
-   - Telethon/MTProto reads the Telegram media.
-   - Backblaze B2 large-file multipart upload stores the media.
-   - B2 folders are object-name prefixes.
-   - The whole video is not intentionally saved to disk.
+## Anime4u.Tamil flow
 
-## Flow
+You do **not** need to create Turso tables manually. The bot creates `anime`, `seasons`, and `episodes` automatically at startup.
 
-Send a video/document → choose `Anime4u.Tamil` or `Anime Live`.
+Use `/add` and enter:
 
-### Anime4u.Tamil
-The bot asks:
-- Anime ID from Turso
-- Season number
-- Episode number
-- Filename
-- Send the file again
+1. Anime title
+2. Synopsis (or `skip`)
+3. Poster URL (or `skip`)
+4. Type (or `skip`)
+5. Genre (or `skip`)
+6. Release year (or `skip`)
+7. Language/dub (or `skip`)
+8. Season number
+9. Episode number
+10. Filename
+11. Send the episode file
 
-Then it creates/updates the season and episode in Turso and stores the Telegram file reference in MongoDB.
+The bot automatically generates an Anime ID from the title. If the same title already exists, it reuses the existing Anime record instead of creating a duplicate.
 
-### Anime Live
-The bot asks:
-- Filename
-- B2 Root/folder
-- Send the file again
+MongoDB stores only the Telegram file reference/message information, not the video itself.
 
-Then it uploads the Telegram media to B2 using multipart upload.
+## Direct media flow
 
-## Environment variables
+If you send a video/document without `/add`, the bot asks:
 
-Copy `.env.example` to `.env` and fill all values.
+- 🌐 Anime4u.Tamil → starts the metadata flow
+- 🔴 Anime Live → asks filename, B2 folder, then uploads the second file to B2
 
-Never commit `.env` or Telegram/B2/Mongo/Turso credentials.
+## Commands
+
+- `/start` — help
+- `/add` — create/add an Anime4u anime and episode
+- `/folders` — show Anime Live B2 folders
+- `/cancel` — cancel current operation
 
 ## Run
 
@@ -48,19 +48,12 @@ pip install -r requirements.txt
 python bot.py
 ```
 
-## Railway / Render
-
-Start command:
+Railway/Render start command:
 
 ```bash
 python bot.py
 ```
 
-This is a long-running Telegram polling/MTProto process. Use a host/service that keeps the process alive.
+## Required environment variables
 
-## Notes
-
-- MongoDB is not a SQL database and needs no SQL schema.
-- Turso tables are created automatically on startup.
-- Existing Anime Live B2 folder logic is preserved.
-- ADMIN_IDS must contain numeric Telegram user IDs separated by commas.
+See `.env.example`.

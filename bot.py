@@ -2,6 +2,8 @@ import os
 import asyncio
 import hashlib
 import io
+import re
+import unicodedata
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -18,16 +20,13 @@ API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
-# MongoDB: Telegram file references only
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 MONGO_DB = os.getenv("MONGO_DB", "anime4u")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "telegram_files")
 
-# Turso: Anime4u metadata only
 TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
 TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 
-# B2: Anime Live Site media
 B2_APPLICATION_KEY_ID = os.getenv("B2_APPLICATION_KEY_ID", "")
 B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY", "")
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME", "")
@@ -81,6 +80,23 @@ def original_filename(message):
     return f"{message.id}.bin"
 
 
+def make_anime_id(title):
+    normalized = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", normalized).strip("-").lower()
+    return slug or "anime"
+
+
+def unique_anime_id(title):
+    base = make_anime_id(title)
+    row = turso.execute("SELECT id FROM anime WHERE id=?", (base,)).fetchone()
+    if not row:
+        return base
+    i = 2
+    while turso.execute("SELECT id FROM anime WHERE id=?", (f"{base}-{i}",)).fetchone():
+        i += 1
+    return f"{base}-{i}"
+
+
 def ensure_turso_schema():
     turso.executescript(
         """
@@ -120,10 +136,30 @@ def ensure_turso_schema():
 
 
 def get_anime(anime_id):
-    row = turso.execute(
-        "SELECT id,title FROM anime WHERE id=? LIMIT 1", (anime_id,)
+    return turso.execute("SELECT id,title FROM anime WHERE id=? LIMIT 1", (anime_id,)).fetchone()
+
+
+def find_anime_by_title(title):
+    return turso.execute(
+        "SELECT id,title FROM anime WHERE lower(title)=lower(?) LIMIT 1", (title,)
     ).fetchone()
-    return row
+
+
+def create_anime(title, synopsis, poster_url, anime_type, genre, release_year, language):
+    existing = find_anime_by_title(title)
+    if existing:
+        return existing[0], existing[1], False
+
+    anime_id = unique_anime_id(title)
+    turso.execute(
+        """
+        INSERT INTO anime(id,title,synopsis,poster_url,type,genre,release_year,language,published)
+        VALUES(?,?,?,?,?,?,?,?,0)
+        """,
+        (anime_id, title, synopsis, poster_url, anime_type, genre, release_year, language),
+    )
+    turso.commit()
+    return anime_id, title, True
 
 
 def ensure_season(anime_id, season_number):
@@ -190,18 +226,12 @@ async def save_anime4u_file(event, session):
 
     anime = await asyncio.to_thread(get_anime, anime_id)
     if not anime:
-        await event.respond("❌ Anime ID no longer exists in Turso.")
+        await event.respond("❌ Anime no longer exists in Turso. Please use /add again.")
         state.pop(event.sender_id, None)
         return
 
     season_id = await asyncio.to_thread(ensure_season, anime_id, season_number)
-    episode_id = await asyncio.to_thread(
-        upsert_episode,
-        anime_id,
-        season_id,
-        episode_number,
-        filename,
-    )
+    episode_id = await asyncio.to_thread(upsert_episode, anime_id, season_id, episode_number, filename)
 
     file_id = None
     file_size = 0
@@ -215,7 +245,6 @@ async def save_anime4u_file(event, session):
         file_size = message.document.size or 0
         media_type = "document"
 
-    # Store Telegram reference in MongoDB, never the media itself.
     doc = {
         "anime_id": anime_id,
         "season": season_number,
@@ -237,13 +266,14 @@ async def save_anime4u_file(event, session):
     )
 
     await event.respond(
-        "✅ **Anime4u.Tamil upload registered**\n\n"
+        "✅ **Anime4u.Tamil episode saved**\n\n"
         f"🎬 `{anime[1]}`\n"
+        f"🆔 `{anime_id}`\n"
         f"📚 Season: `{season_number}`\n"
         f"🎞️ Episode: `{episode_number}`\n"
         f"📄 `{filename}`\n"
         f"📦 `{human_size(file_size)}`\n\n"
-        "💾 Turso: metadata\n"
+        "💾 Turso: anime + season + episode metadata\n"
         "🍃 MongoDB: Telegram file reference"
     )
     state.pop(event.sender_id, None)
@@ -268,30 +298,17 @@ async def upload_to_b2(event, session):
     buffer = bytearray()
 
     try:
-        large_file = await asyncio.to_thread(
-            b2.session.start_large_file,
-            bucket.id_,
-            obj,
-            "b2/x-auto",
-            {},
-        )
+        large_file = await asyncio.to_thread(b2.session.start_large_file, bucket.id_, obj, "b2/x-auto", {})
         file_id = large_file["fileId"]
 
-        async for chunk in message.client.iter_download(
-            message.media, request_size=PART_SIZE, chunk_size=PART_SIZE
-        ):
+        async for chunk in message.client.iter_download(message.media, request_size=PART_SIZE, chunk_size=PART_SIZE):
             buffer.extend(chunk)
             while len(buffer) >= PART_SIZE:
                 part = bytes(buffer[:PART_SIZE])
                 del buffer[:PART_SIZE]
                 digest = hashlib.sha1(part).hexdigest()
                 await asyncio.to_thread(
-                    b2.session.upload_part,
-                    file_id,
-                    part_no,
-                    len(part),
-                    digest,
-                    io.BytesIO(part),
+                    b2.session.upload_part, file_id, part_no, len(part), digest, io.BytesIO(part)
                 )
                 hashes.append(digest)
                 done += len(part)
@@ -311,12 +328,7 @@ async def upload_to_b2(event, session):
             part = bytes(buffer)
             digest = hashlib.sha1(part).hexdigest()
             await asyncio.to_thread(
-                b2.session.upload_part,
-                file_id,
-                part_no,
-                len(part),
-                digest,
-                io.BytesIO(part),
+                b2.session.upload_part, file_id, part_no, len(part), digest, io.BytesIO(part)
             )
             hashes.append(digest)
             done += len(part)
@@ -342,22 +354,20 @@ async def upload_to_b2(event, session):
         state.pop(event.sender_id, None)
 
 
-@events.register(events.NewMessage(pattern=r"^/start$"))
 async def start(event):
     if not is_admin(event):
         return await event.respond("⛔ Admin access only.")
     await event.respond(
         "👑 **Anime4u Unified Upload Bot**\n\n"
-        "Send a video/document and choose:\n\n"
         "🌐 **Anime4u.Tamil** — Turso + MongoDB\n"
         "🔴 **Anime Live** — Backblaze B2\n\n"
-        "/add — add Anime4u episode\n"
+        "/add — create/add an Anime4u anime + episode\n"
         "/folders — show Anime Live B2 folders\n"
-        "/cancel — cancel current operation"
+        "/cancel — cancel current operation\n\n"
+        "You do **not** need to create Turso tables manually."
     )
 
 
-@events.register(events.NewMessage(pattern=r"^/cancel$"))
 async def cancel(event):
     if not is_admin(event):
         return await event.respond("⛔ Admin access only.")
@@ -365,15 +375,18 @@ async def cancel(event):
     await event.respond("❌ Cancelled.")
 
 
-@events.register(events.NewMessage(pattern=r"^/add$"))
 async def add_anime(event):
     if not is_admin(event):
         return await event.respond("⛔ Admin access only.")
-    state[event.sender_id] = {"step": "anime_id"}
-    await event.respond("🌐 **Anime4u.Tamil**\n\nSend the Anime ID from Turso.\n\n/cancel to stop.")
+    state[event.sender_id] = {"step": "anime_title", "destination": "anime4u"}
+    await event.respond(
+        "🌐 **Anime4u.Tamil — New Anime**\n\n"
+        "Send the anime title.\n\n"
+        "Example: `Solo Leveling`\n\n"
+        "/cancel to stop."
+    )
 
 
-@events.register(events.NewMessage(pattern=r"^/folders$"))
 async def folders_command(event):
     if not is_admin(event):
         return await event.respond("⛔ Admin access only.")
@@ -384,17 +397,29 @@ async def folders_command(event):
         await event.respond("❌ Folder read failed.\n`" + str(exc)[:700] + "`")
 
 
-@events.register(events.NewMessage(incoming=True))
 async def media(event):
     if not is_admin(event) or not (event.message.document or event.message.video):
         return
 
     size_bytes = getattr(event.message.document, "size", 0) or getattr(event.message.video, "size", 0) or 0
     if size_bytes > MAX_FILE_SIZE:
-        return await event.respond(
-            f"❌ File exceeds configured limit: **{human_size(MAX_FILE_SIZE)}**"
-        )
+        return await event.respond(f"❌ File exceeds configured limit: **{human_size(MAX_FILE_SIZE)}**")
 
+    session = state.get(event.sender_id)
+
+    # Complete the second-file stage of an Anime4u flow.
+    if session and session.get("step") == "waiting_file":
+        session["message"] = event.message
+        session["size"] = size_bytes
+        return await save_anime4u_file(event, session)
+
+    # Complete the second-file stage of an Anime Live flow.
+    if session and session.get("step") == "live_waiting_file":
+        session["message"] = event.message
+        session["size"] = size_bytes
+        return await upload_to_b2(event, session)
+
+    # A new media upload: ask where it should go.
     state[event.sender_id] = {
         "step": "destination",
         "message": event.message,
@@ -402,8 +427,7 @@ async def media(event):
         "size": size_bytes,
     }
     await event.respond(
-        "📤 **Where do you want to upload this?**\n\n"
-        "Choose one destination:",
+        "📤 **Where do you want to upload this?**\n\nChoose one destination:",
         buttons=[
             [Button.inline("🌐 Anime4u.Tamil", b"dest|anime4u")],
             [Button.inline("🔴 Anime Live", b"dest|live")],
@@ -412,7 +436,6 @@ async def media(event):
     )
 
 
-@events.register(events.NewMessage(incoming=True))
 async def text(event):
     if not is_admin(event):
         return
@@ -426,10 +449,74 @@ async def text(event):
 
     step = session["step"]
 
+    if step == "anime_title":
+        title = text_value[:200]
+        session["title"] = title
+        session["step"] = "synopsis"
+        return await event.respond("📝 Send the synopsis.\n\nOr type `skip`.")
+
+    if step == "synopsis":
+        session["synopsis"] = "" if text_value.lower() == "skip" else text_value[:5000]
+        session["step"] = "poster_url"
+        return await event.respond("🖼️ Send the poster URL.\n\nOr type `skip`.")
+
+    if step == "poster_url":
+        session["poster_url"] = "" if text_value.lower() == "skip" else text_value[:2000]
+        session["step"] = "type"
+        return await event.respond(
+            "📺 Send the type.\n\nExamples: `anime-series`, `movie`, `series`\n\nOr type `skip`."
+        )
+
+    if step == "type":
+        session["type"] = "anime-series" if text_value.lower() == "skip" else text_value[:50]
+        session["step"] = "genre"
+        return await event.respond("🏷️ Send genre(s).\n\nExample: `Action, Fantasy, Adventure`\n\nOr type `skip`.")
+
+    if step == "genre":
+        session["genre"] = "" if text_value.lower() == "skip" else text_value[:500]
+        session["step"] = "release_year"
+        return await event.respond("📅 Send release year.\n\nExample: `2026`\n\nOr type `skip`.")
+
+    if step == "release_year":
+        if text_value.lower() == "skip":
+            session["release_year"] = None
+        else:
+            try:
+                year = int(text_value)
+                if year < 1900 or year > 2200:
+                    raise ValueError
+                session["release_year"] = year
+            except ValueError:
+                return await event.respond("❌ Send a valid year like `2026`, or `skip`.")
+        session["step"] = "language"
+        return await event.respond("🗣️ Send language/dub.\n\nExample: `Tamil Dubbed`\n\nOr type `skip`.")
+
+    if step == "language":
+        session["language"] = "" if text_value.lower() == "skip" else text_value[:100]
+        anime_id, anime_title, created = await asyncio.to_thread(
+            create_anime,
+            session["title"],
+            session["synopsis"],
+            session["poster_url"],
+            session["type"],
+            session["genre"],
+            session["release_year"],
+            session["language"],
+        )
+        session["anime_id"] = anime_id
+        session["anime_title"] = anime_title
+        session["step"] = "season"
+        action = "created" if created else "found existing"
+        return await event.respond(
+            f"✅ Anime `{anime_title}` {action}.\n\n"
+            f"🆔 Anime ID: `{anime_id}`\n\n"
+            "Send season number (example: `1`)."
+        )
+
     if step == "anime_id":
         anime = await asyncio.to_thread(get_anime, text_value)
         if not anime:
-            return await event.respond("❌ Anime ID not found in Turso. Send a valid ID.")
+            return await event.respond("❌ Anime ID not found in Turso. Use /add to create an anime first.")
         session["anime_id"] = text_value
         session["anime_title"] = anime[1]
         session["step"] = "season"
@@ -457,7 +544,7 @@ async def text(event):
         session["step"] = "name"
         return await event.respond(
             "🎞️ Episode saved.\n\n"
-            f"Original filename: `{session['original']}`\n\n"
+            f"Original filename: `{session.get('original', 'unknown')}`\n\n"
             "Send the filename to store for this episode."
         )
 
@@ -469,7 +556,7 @@ async def text(event):
         session["step"] = "waiting_file"
         return await event.respond(
             f"📄 Filename: `{name}`\n\n"
-            "Now send the episode file again to register it in Anime4u.Tamil."
+            "Now send the episode file again."
         )
 
     if step == "live_name":
@@ -488,21 +575,6 @@ async def text(event):
     await event.respond("ℹ️ Follow the buttons/prompts for the current upload.")
 
 
-@events.register(events.NewMessage(incoming=True))
-async def waiting_file(event):
-    # This handler is intentionally separate so a second media message can complete
-    # an Anime4u flow after the metadata prompts.
-    if not is_admin(event) or not (event.message.document or event.message.video):
-        return
-    session = state.get(event.sender_id)
-    if not session or session.get("step") != "waiting_file":
-        return
-    session["message"] = event.message
-    session["size"] = getattr(event.message.document, "size", 0) or getattr(event.message.video, "size", 0) or 0
-    await save_anime4u_file(event, session)
-
-
-@events.register(events.CallbackQuery)
 async def callback(event):
     if not is_admin(event):
         return await event.answer("⛔ Admin access only.", alert=True)
@@ -518,8 +590,12 @@ async def callback(event):
         if not session:
             return await event.answer("No pending file.", alert=True)
         session["destination"] = "anime4u"
-        session["step"] = "anime_id"
-        return await event.edit("🌐 **Anime4u.Tamil**\n\nSend the Anime ID from Turso.")
+        session["step"] = "anime_title"
+        return await event.edit(
+            "🌐 **Anime4u.Tamil**\n\n"
+            "Send the anime title.\n\n"
+            "Example: `Solo Leveling`"
+        )
 
     if data == "dest|live":
         if not session:
@@ -590,15 +666,18 @@ async def main():
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)
 
-    # Explicitly attach all registered handlers.
-    for handler in (start, cancel, add_anime, folders_command, media, text, waiting_file, callback):
-        client.add_event_handler(handler)
+    client.add_event_handler(start, events.NewMessage(pattern=r"^/start$"))
+    client.add_event_handler(cancel, events.NewMessage(pattern=r"^/cancel$"))
+    client.add_event_handler(add_anime, events.NewMessage(pattern=r"^/add$"))
+    client.add_event_handler(folders_command, events.NewMessage(pattern=r"^/folders$"))
+    client.add_event_handler(media, events.NewMessage(incoming=True))
+    client.add_event_handler(text, events.NewMessage(incoming=True))
+    client.add_event_handler(callback, events.CallbackQuery())
 
     me = await client.get_me()
     print(f"🤖 Logged in as @{me.username or me.id}")
     print(f"☁️ B2 bucket: {B2_BUCKET_NAME}")
     print("🚀 Anime4u Unified Upload Bot is running.")
-
     await client.run_until_disconnected()
 
 
