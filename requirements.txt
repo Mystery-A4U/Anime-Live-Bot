@@ -1,2 +1,6 @@
-telethon>=1.41,<2
-b2sdk>=2.9,<3
+python-telegram-bot>=22,<23
+telethon>=1.42,<2
+pymongo>=4.10,<5
+python-dotenv>=1.0,<2
+libsql-experimental>=0.0.34
+b2sdk>=2.8,<3
