@@ -154,7 +154,7 @@ def create_anime(title, synopsis, poster_url, anime_type, genre, release_year, l
     turso.execute(
         """
         INSERT INTO anime(id,title,synopsis,poster_url,type,genre,release_year,language,published)
-        VALUES(?,?,?,?,?,?,?,?,0)
+        VALUES(?,?,?,?,?,?,?,?,1)
         """,
         (anime_id, title, synopsis, poster_url, anime_type, genre, release_year, language),
     )
@@ -178,7 +178,7 @@ def upsert_episode(anime_id, season_id, episode_number, title):
     turso.execute(
         """
         INSERT INTO episodes(anime_id,season_id,episode_number,title,published)
-        VALUES(?,?,?,?,0)
+        VALUES(?,?,?,?,1)
         ON CONFLICT(anime_id,season_id,episode_number)
         DO UPDATE SET title=excluded.title
         """,
@@ -232,6 +232,12 @@ async def save_anime4u_file(event, session):
 
     season_id = await asyncio.to_thread(ensure_season, anime_id, season_number)
     episode_id = await asyncio.to_thread(upsert_episode, anime_id, season_id, episode_number, filename)
+    await asyncio.to_thread(
+        turso.execute,
+        "UPDATE anime SET published=1 WHERE id=?",
+        (anime_id,),
+    )
+    await asyncio.to_thread(turso.commit)
 
     file_id = None
     file_size = 0
